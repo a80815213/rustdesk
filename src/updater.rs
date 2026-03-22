@@ -128,71 +128,99 @@ fn check_update(manually: bool) -> ResultType<()> {
         return Ok(());
     }
 
+    // ==============================================
+    // 【核心修改】获取官方检测到的最新版本号
+    // ==============================================
     let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
     if update_url.is_empty() {
         log::debug!("No update available.");
+        return Ok(());
+    }
+
+    // 从官方链接中提取版本号（如 1.2.5）
+    let version = update_url.rsplit('/').next().unwrap_or_default();
+    if version.is_empty() {
+        log::debug!("Failed to get version");
+        return Ok(());
+    }
+    log::info!("Detected latest official version: {}", version);
+
+    // ==============================================
+    // 【自定义】拼接你的 GitHub 下载地址
+    // ==============================================
+    let download_url = format!(
+        "https://github.com/waterbaizhang/tv/releases/download/{}",
+        version
+    );
+
+    // 根据系统自动选择安装包名称（可按你编译的文件名修改）
+    #[cfg(target_os = "windows")]
+    let download_url = if cfg!(feature = "flutter") {
+        format!(
+            "{}/rustdesk-{}-x86_64.{}",
+            download_url,
+            version,
+            if update_msi { "msi" } else { "exe" }
+        )
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            format!(
-                "{}/rustdesk-{}-x86_64.{}",
-                download_url,
-                version,
-                if update_msi { "msi" } else { "exe" }
-            )
+        format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+    };
+
+    // Linux 适配
+    #[cfg(target_os = "linux")]
+    let download_url = format!("{}/rustdesk-{}-x86_64.deb", download_url, version);
+
+    // macOS 适配
+    #[cfg(target_os = "macos")]
+    let download_url = format!("{}/rustdesk-{}-x86_64.dmg", download_url, version);
+
+    log::info!("Custom update download URL: {}", &download_url);
+    // ==============================================
+    // 以下代码保持不变（下载、校验、安装逻辑）
+    // ==============================================
+    let client = create_http_client_with_url(&download_url);
+    let Some(file_path) = get_download_file_from_url(&download_url) else {
+        bail!("Failed to get the file path from the URL: {}", download_url);
+    };
+    let mut is_file_exists = false;
+    if file_path.exists() {
+        let file_size = std::fs::metadata(&file_path)?.len();
+        let response = client.head(&download_url).send()?;
+        if !response.status().is_success() {
+            bail!("Failed to get the file size: {}", response.status());
+        }
+        let total_size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|ct_len| ct_len.to_str().ok())
+            .and_then(|ct_len| ct_len.parse::<u64>().ok());
+        let Some(total_size) = total_size else {
+            bail!("Failed to get content length");
+        };
+        if file_size == total_size {
+            is_file_exists = true;
         } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
-        };
-        log::debug!("New version available: {}", &version);
-        let client = create_http_client_with_url(&download_url);
-        let Some(file_path) = get_download_file_from_url(&download_url) else {
-            bail!("Failed to get the file path from the URL: {}", download_url);
-        };
-        let mut is_file_exists = false;
-        if file_path.exists() {
-            // Check if the file size is the same as the server file size
-            // If the file size is the same, we don't need to download it again.
-            let file_size = std::fs::metadata(&file_path)?.len();
-            let response = client.head(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!("Failed to get the file size: {}", response.status());
-            }
-            let total_size = response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|ct_len| ct_len.to_str().ok())
-                .and_then(|ct_len| ct_len.parse::<u64>().ok());
-            let Some(total_size) = total_size else {
-                bail!("Failed to get content length");
-            };
-            if file_size == total_size {
-                is_file_exists = true;
-            } else {
-                std::fs::remove_file(&file_path)?;
-            }
-        }
-        if !is_file_exists {
-            let response = client.get(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!(
-                    "Failed to download the new version file: {}",
-                    response.status()
-                );
-            }
-            let file_data = response.bytes()?;
-            let mut file = std::fs::File::create(&file_path)?;
-            file.write_all(&file_data)?;
-        }
-        // We have checked if the `conns` is empty before, but we need to check again.
-        // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
-        // before the download, but not empty after the download.
-        if has_no_active_conns() {
-            #[cfg(target_os = "windows")]
-            update_new_version(update_msi, &version, &file_path);
+            std::fs::remove_file(&file_path)?;
         }
     }
+    if !is_file_exists {
+        let response = client.get(&download_url).send()?;
+        if !response.status().is_success() {
+            bail!(
+                "Failed to download the new version file: {}",
+                response.status()
+            );
+        }
+        let file_data = response.bytes()?;
+        let mut file = std::fs::File::create(&file_path)?;
+        file.write_all(&file_data)?;
+    }
+
+    if has_no_active_conns() {
+        #[cfg(target_os = "windows")]
+        update_new_version(update_msi, &version, &file_path);
+    }
+
     Ok(())
 }
 
